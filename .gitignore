@@ -1,0 +1,8 @@
+__pycache__/
+.venv/
+*.pyc
+.env
+*.json
+.vscode/
+.idea/
+Thumbs.db
