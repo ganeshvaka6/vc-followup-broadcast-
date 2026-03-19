@@ -2,6 +2,7 @@ import os
 import json
 import re
 import time
+from datetime import datetime
 from flask import Flask, render_template, request, jsonify
 import gspread
 from google.oauth2.service_account import Credentials
@@ -14,7 +15,8 @@ import pytz
 TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM")  # e.g., whatsapp:+1415xxxxxxx
-TWILIO_CONTENT_SID = os.getenv("TWILIO_CONTENT_SID_CONCERT")  # HX...
+TWILIO_CONTENT_SID_SUNDAY = os.getenv("TWILIO_CONTENT_SID_SUNDAY")
+TWILIO_CONTENT_SID_WEDNESDAY = os.getenv("TWILIO_CONTENT_SID_WEDNESDAY")
 
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "ConcertBookings")
 GOOGLE_SHEET_KEY = os.getenv("GOOGLE_SHEET_KEY")
@@ -94,46 +96,111 @@ def get_recipients_from_sheet():
         recipients = recipients[:MAX_RECIPIENTS_PER_RUN]
     return recipients
 
+# ---------- Message builders & kind resolution ----------
 
-def send_template_message(name: str, mobile_digits: str):
-    if not (TWILIO_SID and TWILIO_AUTH and TWILIO_WHATSAPP_FROM and TWILIO_CONTENT_SID and twilio_client):
+def build_message_text(kind: str, name: str, event_text: str) -> str:
+    """Return a polished WhatsApp message body for the given 'kind'."""
+    safe_name = name.strip() if name and name.strip() else NAME_FALLBACK
+
+    if kind == "wednesday":
+        return (
+            f"Dear {safe_name}, we invite you to join us for our Wednesday Mid-Week Service.\n\n"
+            f"Prayer Time: 6:30 PM\n"
+            f"Service Start: 7:30 PM\n"
+            f"Followed by dinner and fellowship.\n\n"
+            f"We look forward to worshipping together!"
+        )
+    else:
+        return (
+            f"Dear {safe_name}, we invite you to join us for this week's Sunday Services.\n\n"
+            f"Bible Study – Topic: Kingdom Prosperity – Time: 9:30 AM\n"
+            f"Morning Service (Telugu & English) – Start Time: 10:30 AM\n"
+            f"Evening Prayer – 5:30 PM\n"
+            f"Evening Service (Telugu & English) – Service Start Time: 6:30 PM\n\n"
+            f"We warmly welcome you to join us."
+        )
+
+
+def resolve_broadcast_kind(now_dt) -> str:
+    """Return 'wednesday' on Wednesdays, 'sunday' on Saturdays, else 'sunday' by default."""
+    dow = now_dt.weekday()  # Monday=0 ... Sunday=6
+    if dow == 2:  # Wednesday
+        return "wednesday"
+    if dow == 5:  # Saturday
+        return "sunday"
+    return "sunday"
+
+
+def pick_content_sid(kind: str) -> str | None:
+    if kind == "wednesday":
+        return TWILIO_CONTENT_SID_WEDNESDAY
+    return TWILIO_CONTENT_SID_SUNDAY
+
+
+def send_template_message(name: str, mobile_digits: str, kind: str):
+    if not (TWILIO_SID and TWILIO_AUTH and TWILIO_WHATSAPP_FROM and twilio_client):
         print("[ERROR] Missing Twilio configuration")
         return None
-    safe_name = name.strip() if name and name.strip() else NAME_FALLBACK
+
+    content_sid = pick_content_sid(kind)
+    if not content_sid:
+        print(f"[ERROR] No Content SID configured for kind={kind}")
+        return None
+
     to_wa = format_whatsapp_to(mobile_digits)
+
+    # Build the message body (optional: only if your template includes a body variable)
+    body_text = build_message_text(kind, name, BROADCAST_EVENT_TEXT)
+
+    safe_name = name.strip() if name and name.strip() else NAME_FALLBACK
+
+    # Map to your template variables precisely.
+    # If your templates only have {{1}}=Name, then remove the {{2}} below.
+    variables = {
+        "1": safe_name,
+        "2": body_text,  # remove this if your template doesn't have {{2}}
+    }
+
     payload = {
         "from_": TWILIO_WHATSAPP_FROM,
         "to": to_wa,
-        "content_sid": TWILIO_CONTENT_SID,
-        # Adjust to your approved template variable count/order
-        "content_variables": json.dumps({
-            "1": safe_name,
-            "2": BROADCAST_EVENT_TEXT,
-        }),
+        "content_sid": content_sid,
+        "content_variables": json.dumps(variables),
     }
+
     try:
         msg = twilio_client.messages.create(**payload)
-        print(f"[INFO] Sent to {to_wa}: SID={msg.sid}")
+        print(f"[INFO] Sent ({kind}) to {to_wa}: SID={msg.sid}")
         return msg.sid
     except Exception as e:
-        print(f"[ERROR] Send failed to {to_wa}: {e}")
+        print(f"[ERROR] Send failed to {to_wa} ({kind}): {e}")
         return None
 
+# ---------- Broadcast ----------
 
-def do_broadcast(reason: str = "scheduled"):
+def do_broadcast(reason: str = "scheduled", override_kind: str | None = None):
     if not BROADCAST_ENABLE:
         print("[INFO] Broadcast disabled")
         return {"ok": True, "message": "disabled"}
+
+    # Decide kind via auto-day detection
+    now_local = pytz.utc.localize(datetime.utcnow()).astimezone(TZ)
+    kind = override_kind or resolve_broadcast_kind(now_local)
+    if kind not in ("sunday", "wednesday"):
+        kind = "sunday"
+
     recipients = get_recipients_from_sheet()
-    print(f"[INFO] Broadcast run ({reason}) recipients={len(recipients)}")
+    print(f"[INFO] Broadcast run ({reason}) kind={kind} recipients={len(recipients)}")
     sent = 0
     failed = 0
+
     for name, digits in recipients:
-        sid = send_template_message(name, digits)
+        sid = send_template_message(name, digits, kind=kind)
         sent += 1 if sid else 0
         failed += 0 if sid else 1
         time.sleep(THROTTLE_SECONDS)
-    summary = {"ok": True, "sent": sent, "failed": failed, "total": len(recipients)}
+
+    summary = {"ok": True, "sent": sent, "failed": failed, "total": len(recipients), "kind": kind}
     print(f"[INFO] Summary: {summary}")
     return summary
 
@@ -147,7 +214,8 @@ def broadcast_run():
     if CLEAR_TOKEN and request.headers.get('X-CLEAR-TOKEN') != CLEAR_TOKEN:
         return jsonify({"ok": False, "message": "Unauthorized"}), 401
     try:
-        res = do_broadcast(reason='manual')
+        override = request.args.get("kind")  # optional: sunday | wednesday
+        res = do_broadcast(reason='manual', override_kind=override)
         return jsonify(res), 200
     except Exception as e:
         return jsonify({"ok": False, "message": str(e)}), 500
@@ -172,9 +240,9 @@ scheduler = BackgroundScheduler(timezone=TZ)
 
 def start_scheduler():
     try:
-        # Wednesday 09:00 IST
+        # Wednesday 09:00 IST -> will auto-select 'wednesday'
         scheduler.add_job(lambda: do_broadcast('cron_wed_09'), CronTrigger(day_of_week='wed', hour=9, minute=0, timezone=TZ), id='wed_09', replace_existing=True)
-        # Saturday 20:00 IST
+        # Saturday 20:00 IST -> will auto-select 'sunday'
         scheduler.add_job(lambda: do_broadcast('cron_sat_20'), CronTrigger(day_of_week='sat', hour=20, minute=0, timezone=TZ), id='sat_20', replace_existing=True)
         scheduler.start()
         print('[INFO] APScheduler started (Wed 09:00, Sat 20:00 Asia/Kolkata)')
