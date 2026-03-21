@@ -1,0 +1,75 @@
+services:
+  - type: web
+    name: victory-church-followup
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: APP_TIMEZONE
+        value: Asia/Kolkata
+      - key: START_SCHEDULER
+        value: "true"
+      - key: BROADCAST_ENABLE
+        value: "true"
+      - key: BROADCAST_NAME_FALLBACK
+        value: "Friend"
+      - key: THROTTLE_PER_MESSAGE_SECONDS
+        value: "0.15"
+      - key: MAX_RECIPIENTS_PER_RUN
+        value: "2000"
+      - key: GOOGLE_SHEET_NAME
+        value: VictoryChurchFollowup
+      - key: SERVICE_ACCOUNT_FILE
+        value: /etc/secrets/service_account.json
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false
+      - key: TWILIO_CONTENT_SID_SUNDAY
+        sync: false
+      - key: TWILIO_CONTENT_SID_WEDNESDAY
+        sync: false
+      - key: GOOGLE_SHEET_KEY
+        sync: false
+      - key: CLEAR_TOKEN
+        sync: false
+      - key: PREF_WINDOW_WEEKLY_DAYS
+        value: "35"
+      - key: PREF_THRESHOLD_WEEKLY
+        value: "3"
+      - key: PREF_WINDOW_BIWEEKLY_DAYS
+        value: "60"
+      - key: PREF_THRESHOLD_BIWEEKLY
+        value: "1"
+      - key: BROADCAST_PREFERENCE_DEFAULT
+        value: Weekly
+
+# Optional cron jobs (UTC)
+cronJobs:
+  - name: wed-09am-ist
+    schedule: "30 3 * * 3"   # 09:00 IST
+    runtime: docker
+    envVars:
+      - key: TARGET_URL
+        value: https://YOUR_HOST.onrender.com/broadcast/run?kind=wednesday
+      - key: CLEAR_TOKEN
+        sync: false
+    startCommand: |
+      curl -sS -X POST "$TARGET_URL" -H "X-CLEAR-TOKEN: $CLEAR_TOKEN"
+
+  - name: sat-8pm-ist
+    schedule: "30 14 * * 6"  # 20:00 IST
+    runtime: docker
+    envVars:
+      - key: TARGET_URL
+        value: https://YOUR_HOST.onrender.com/broadcast/run?kind=sunday
+      - key: CLEAR_TOKEN
+        sync: false
+    startCommand: |
+      curl -sS -X POST "$TARGET_URL" -H "X-CLEAR-TOKEN: $CLEAR_TOKEN"
