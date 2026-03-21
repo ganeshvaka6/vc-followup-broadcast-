@@ -34,6 +34,13 @@ THROTTLE_SECONDS = float(os.getenv("THROTTLE_PER_MESSAGE_SECONDS", "0.15"))
 MAX_RECIPIENTS_PER_RUN = int(os.getenv("MAX_RECIPIENTS_PER_RUN", "2000"))
 START_SCHEDULER = os.getenv("START_SCHEDULER", "true").lower() == "true"
 
+# Computed-preference thresholds (for Sunday {{3}})
+PREF_WINDOW_WEEKLY_DAYS = int(os.getenv("PREF_WINDOW_WEEKLY_DAYS", "35"))
+PREF_THRESHOLD_WEEKLY = int(os.getenv("PREF_THRESHOLD_WEEKLY", "3"))
+PREF_WINDOW_BIWEEKLY_DAYS = int(os.getenv("PREF_WINDOW_BIWEEKLY_DAYS", "60"))
+PREF_THRESHOLD_BIWEEKLY = int(os.getenv("PREF_THRESHOLD_BIWEEKLY", "1"))
+PREFERENCE_DEFAULT = os.getenv("BROADCAST_PREFERENCE_DEFAULT", "Weekly")
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -42,14 +49,14 @@ SCOPES = [
 app = Flask(__name__)
 
 # Twilio client
-twilio_client = None
-if TWILIO_SID and TWILIO_AUTH:
-    try:
-        twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
-    except Exception as e:
-        print(f"[WARN] Twilio client init failed: {e}")
+try:
+    twilio_client = Client(TWILIO_SID, TWILIO_AUTH) if TWILIO_SID and TWILIO_AUTH else None
+except Exception as e:
+    twilio_client = None
+    print(f"[WARN] Twilio client init failed: {e}")
 
 # ---------- Google Sheets ----------
+
 def build_creds():
     return Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 
@@ -59,7 +66,8 @@ def get_sheet():
     client = gspread.authorize(creds)
     sh = client.open_by_key(GOOGLE_SHEET_KEY) if GOOGLE_SHEET_KEY else client.open(GOOGLE_SHEET_NAME)
     ws = sh.sheet1
-    if not ws.get_all_values():
+    values = ws.get_all_values()
+    if not values:
         ws.append_row(["Timestamp", "User Code", "Name", "Mobile"])
     return ws
 
@@ -68,6 +76,7 @@ def get_sheet():
 def extract_digits(s: str) -> str:
     return "".join(re.findall(r"\d+", s or ""))
 
+
 def format_whatsapp_to(digits: str) -> str:
     if digits.startswith("91") and len(digits) == 12:
         return f"whatsapp:+{digits}"
@@ -75,7 +84,8 @@ def format_whatsapp_to(digits: str) -> str:
         return f"whatsapp:+91{digits}"
     return f"whatsapp:+{digits}"
 
-def parse_timestamp(ts_str: str):
+
+def parse_timestamp(ts_str: str) -> Optional[datetime]:
     if not ts_str:
         return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
@@ -84,6 +94,7 @@ def parse_timestamp(ts_str: str):
         except Exception:
             pass
     return None
+
 
 def get_recipients_from_sheet():
     ws = get_sheet()
@@ -95,11 +106,43 @@ def get_recipients_from_sheet():
         name = (row[2].strip() if len(row) > 2 else "")
         mobile = (row[3].strip() if len(row) > 3 else "")
         digits = extract_digits(mobile)
-        if not digits:
-            continue
-        by_mobile[digits] = name or ""
+        if digits:
+            by_mobile[digits] = name or ""
     recipients = [(n, m) for m, n in by_mobile.items()]
     return recipients[:MAX_RECIPIENTS_PER_RUN]
+
+
+def load_contact_events():
+    ws = get_sheet()
+    values = ws.get_all_values()
+    events = {}
+    if not values or len(values) <= 1:
+        return events
+    for row in values[1:]:
+        ts = parse_timestamp(row[0] if len(row) > 0 else "")
+        mobile = (row[3].strip() if len(row) > 3 else "")
+        digits = extract_digits(mobile)
+        if ts and digits:
+            events.setdefault(digits, []).append(ts)
+    for k in events:
+        events[k].sort(reverse=True)
+    return events
+
+
+def compute_preference_from_history(digits: str, events_by_digits: dict, now_dt: Optional[datetime] = None) -> str:
+    now_dt = now_dt or datetime.utcnow()
+    evts = events_by_digits.get(digits, [])
+
+    def count_in_last(days: int) -> int:
+        cutoff = now_dt - timedelta(days=days)
+        return sum(1 for t in evts if t >= cutoff)
+
+    if count_in_last(PREF_WINDOW_WEEKLY_DAYS) >= PREF_THRESHOLD_WEEKLY:
+        return "Weekly"
+    if count_in_last(PREF_WINDOW_BIWEEKLY_DAYS) >= PREF_THRESHOLD_BIWEEKLY:
+        return "Biweekly"
+    return "Monthly"
+
 
 def compute_upcoming_sunday_str(tz) -> str:
     now_local = pytz.utc.localize(datetime.utcnow()).astimezone(tz)
@@ -108,6 +151,7 @@ def compute_upcoming_sunday_str(tz) -> str:
     target = (now_local + timedelta(days=days_ahead)).date()
     return target.strftime("%d-%m-%Y")
 
+
 def compute_upcoming_wednesday_str(tz) -> str:
     now_local = pytz.utc.localize(datetime.utcnow()).astimezone(tz)
     dow = now_local.weekday()
@@ -115,41 +159,49 @@ def compute_upcoming_wednesday_str(tz) -> str:
     target = (now_local + timedelta(days=days_ahead)).date()
     return target.strftime("%d-%m-%Y")
 
+
 def pick_content_sid(kind: str) -> Optional[str]:
     return TWILIO_CONTENT_SID_WEDNESDAY if kind == "wednesday" else TWILIO_CONTENT_SID_SUNDAY
 
-# ---------- Sending ----------
-def send_template_message(name: str, mobile_digits: str, kind: str, *, date_str: str):
-    if not twilio_client:
+# ---------- Send ----------
+
+def send_template_message(name: str, mobile_digits: str, kind: str, *, date_str: str, preference: Optional[str] = None):
+    if not (twilio_client and TWILIO_WHATSAPP_FROM):
         print("[ERROR] Twilio not configured")
         return None
 
     content_sid = pick_content_sid(kind)
     if not content_sid:
-        print(f"[ERROR] Missing Content SID for {kind}")
+        print(f"[ERROR] Missing Content SID for kind={kind}")
         return None
 
     to_wa = format_whatsapp_to(mobile_digits)
-    safe_name = name.strip() if name.strip() else NAME_FALLBACK
+    safe_name = name.strip() if name and name.strip() else NAME_FALLBACK
 
-    # Only 2 variables now
-    variables = {"1": safe_name, "2": date_str}
+    if kind == "wednesday":
+        # 2 variables
+        variables = {"1": safe_name, "2": date_str}
+    else:
+        # Sunday -> 3 variables (Name, Date, Preference)
+        pref_val = (preference or PREFERENCE_DEFAULT)
+        variables = {"1": safe_name, "2": date_str, "3": pref_val}
 
     try:
         msg = twilio_client.messages.create(
             from_=TWILIO_WHATSAPP_FROM,
             to=to_wa,
             content_sid=content_sid,
-            content_variables=json.dumps(variables)
+            content_variables=json.dumps(variables),
         )
-        print(f"[INFO] Sent ({kind}) to {to_wa} SID={msg.sid}")
+        print(f"[INFO] Sent ({kind}) to {to_wa}: SID={msg.sid}")
         return msg.sid
     except Exception as e:
-        print(f"[ERROR] Failed to send to {to_wa}: {e}")
+        print(f"[ERROR] Send failed to {to_wa} ({kind}): {e}")
         return None
 
 # ---------- Broadcast ----------
-def resolve_broadcast_kind(now_dt):
+
+def resolve_broadcast_kind(now_dt: datetime) -> str:
     dow = now_dt.weekday()
     if dow == 2:
         return "wednesday"
@@ -157,39 +209,51 @@ def resolve_broadcast_kind(now_dt):
         return "sunday"
     return "sunday"
 
-def do_broadcast(reason="scheduled", override_kind=None):
+
+def do_broadcast(reason: str = "scheduled", override_kind: Optional[str] = None):
     if not BROADCAST_ENABLE:
+        print("[INFO] Broadcast disabled")
         return {"ok": True, "message": "disabled"}
 
     now_local = pytz.utc.localize(datetime.utcnow()).astimezone(TZ)
     kind = override_kind or resolve_broadcast_kind(now_local)
+    if kind not in ("sunday", "wednesday"):
+        kind = "sunday"
 
     recipients = get_recipients_from_sheet()
+    events_by_digits = load_contact_events() if kind == "sunday" else {}
 
     date_str = compute_upcoming_wednesday_str(TZ) if kind == "wednesday" else compute_upcoming_sunday_str(TZ)
 
     sent = failed = 0
     for (name, digits) in recipients:
-        sid = send_template_message(name, digits, kind, date_str=date_str)
+        pref = compute_preference_from_history(digits, events_by_digits) if kind == "sunday" else None
+        sid = send_template_message(name, digits, kind, date_str=date_str, preference=pref)
         sent += 1 if sid else 0
         failed += 0 if sid else 1
         time.sleep(THROTTLE_SECONDS)
 
-    return {"ok": True, "kind": kind, "date": date_str, "sent": sent, "failed": failed, "total": len(recipients)}
+    summary = {"ok": True, "sent": sent, "failed": failed, "total": len(recipients), "kind": kind, "date": date_str}
+    print(f"[INFO] Summary: {summary}")
+    return summary
 
 # ---------- Routes ----------
-@app.route("/")
+@app.route('/', methods=['GET'])
 def index():
-    return render_template("index.html")
+    return render_template('index.html')
 
-@app.route("/broadcast/run", methods=["POST"])
+@app.route('/broadcast/run', methods=['POST'])
 def broadcast_run():
-    if request.headers.get("X-CLEAR-TOKEN") != CLEAR_TOKEN:
+    if CLEAR_TOKEN and request.headers.get('X-CLEAR-TOKEN') != CLEAR_TOKEN:
         return jsonify({"ok": False, "message": "Unauthorized"}), 401
-    kind = request.args.get("kind")
-    return jsonify(do_broadcast("manual", kind)), 200
+    try:
+        override = request.args.get("kind")
+        res = do_broadcast(reason='manual', override_kind=override)
+        return jsonify(res), 200
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
 
-@app.route("/health")
+@app.route('/health', methods=['GET','HEAD'])
 def health():
     return jsonify({"status": "ok"}), 200
 
@@ -197,12 +261,17 @@ def health():
 scheduler = BackgroundScheduler(timezone=TZ)
 
 def start_scheduler():
-    scheduler.add_job(lambda: do_broadcast("auto"), CronTrigger(day_of_week="wed", hour=9, minute=0, timezone=TZ))
-    scheduler.add_job(lambda: do_broadcast("auto"), CronTrigger(day_of_week="sat", hour=20, minute=0, timezone=TZ))
-    scheduler.start()
+    try:
+        scheduler.add_job(lambda: do_broadcast('cron_wed_09'), CronTrigger(day_of_week='wed', hour=9, minute=0, timezone=TZ), id='wed_09', replace_existing=True)
+        scheduler.add_job(lambda: do_broadcast('cron_sat_20'), CronTrigger(day_of_week='sat', hour=20, minute=0, timezone=TZ), id='sat_20', replace_existing=True)
+        scheduler.start()
+        print('[INFO] APScheduler started (Wed 09:00, Sat 20:00 Asia/Kolkata)')
+    except Exception as e:
+        print(f'[ERROR] Scheduler start failed: {e}')
 
 if START_SCHEDULER:
     start_scheduler()
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+if __name__ == '__main__':
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
